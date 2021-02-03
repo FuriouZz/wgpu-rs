@@ -1,7 +1,9 @@
+use std::future::Future;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
 use winit::{
     event::{self, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    window::Window,
 };
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
@@ -15,8 +17,7 @@ pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
 
 #[allow(dead_code)]
 pub fn cast_slice<T>(data: &[T]) -> &[u8] {
-    use std::mem::size_of;
-    use std::slice::from_raw_parts;
+    use std::{mem::size_of, slice::from_raw_parts};
 
     unsafe { from_raw_parts(data.as_ptr() as *const u8, data.len() * size_of::<T>()) }
 }
@@ -29,59 +30,179 @@ pub enum ShaderStage {
 }
 
 pub trait Example: 'static + Sized {
+    fn optional_features() -> wgpu::Features {
+        wgpu::Features::empty()
+    }
+    fn required_features() -> wgpu::Features {
+        wgpu::Features::empty()
+    }
+    fn required_limits() -> wgpu::Limits {
+        wgpu::Limits::default()
+    }
     fn init(
         sc_desc: &wgpu::SwapChainDescriptor,
+        adapter: &wgpu::Adapter,
         device: &wgpu::Device,
-    ) -> (Self, Option<wgpu::CommandBuffer>);
+        queue: &wgpu::Queue,
+    ) -> Self;
     fn resize(
         &mut self,
         sc_desc: &wgpu::SwapChainDescriptor,
         device: &wgpu::Device,
-    ) -> Option<wgpu::CommandBuffer>;
+        queue: &wgpu::Queue,
+    );
     fn update(&mut self, event: WindowEvent);
     fn render(
         &mut self,
-        frame: &wgpu::SwapChainOutput,
+        frame: &wgpu::SwapChainTexture,
         device: &wgpu::Device,
-    ) -> wgpu::CommandBuffer;
+        queue: &wgpu::Queue,
+        spawner: &Spawner,
+    );
 }
 
-async fn run_async<E: Example>(event_loop: EventLoop<()>, window: Window) {
-    log::info!("Initializing the surface...");
+struct Setup {
+    window: winit::window::Window,
+    event_loop: EventLoop<()>,
+    instance: wgpu::Instance,
+    size: winit::dpi::PhysicalSize<u32>,
+    surface: wgpu::Surface,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
 
-    let (size, surface) = {
-        let size = window.inner_size();
-        let surface = wgpu::Surface::create(&window);
-        (size, surface)
+async fn setup<E: Example>(title: &str) -> Setup {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let chrome_tracing_dir = std::env::var("WGPU_CHROME_TRACE");
+        wgpu_subscriber::initialize_default_subscriber(
+            chrome_tracing_dir.as_ref().map(std::path::Path::new).ok(),
+        );
     };
 
-    let adapter = wgpu::Adapter::request(
-        &wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::Default,
+    let event_loop = EventLoop::new();
+    let mut builder = winit::window::WindowBuilder::new();
+    builder = builder.with_title(title);
+    #[cfg(windows_OFF)] // TODO
+    {
+        use winit::platform::windows::WindowBuilderExtWindows;
+        builder = builder.with_no_redirection_bitmap(true);
+    }
+    let window = builder.build(&event_loop).unwrap();
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::platform::web::WindowExtWebSys;
+        console_log::init().expect("could not initialize logger");
+        std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+        // On wasm, append the canvas to the document body
+        web_sys::window()
+            .and_then(|win| win.document())
+            .and_then(|doc| doc.body())
+            .and_then(|body| {
+                body.append_child(&web_sys::Element::from(window.canvas()))
+                    .ok()
+            })
+            .expect("couldn't append canvas to document body");
+    }
+
+    log::info!("Initializing the surface...");
+
+    let backend = if let Ok(backend) = std::env::var("WGPU_BACKEND") {
+        match backend.to_lowercase().as_str() {
+            "vulkan" => wgpu::BackendBit::VULKAN,
+            "metal" => wgpu::BackendBit::METAL,
+            "dx12" => wgpu::BackendBit::DX12,
+            "dx11" => wgpu::BackendBit::DX11,
+            "gl" => wgpu::BackendBit::GL,
+            "webgpu" => wgpu::BackendBit::BROWSER_WEBGPU,
+            other => panic!("Unknown backend: {}", other),
+        }
+    } else {
+        wgpu::BackendBit::PRIMARY
+    };
+    let power_preference = if let Ok(power_preference) = std::env::var("WGPU_POWER_PREF") {
+        match power_preference.to_lowercase().as_str() {
+            "low" => wgpu::PowerPreference::LowPower,
+            "high" => wgpu::PowerPreference::HighPerformance,
+            other => panic!("Unknown power preference: {}", other),
+        }
+    } else {
+        wgpu::PowerPreference::default()
+    };
+    let instance = wgpu::Instance::new(backend);
+    let (size, surface) = unsafe {
+        let size = window.inner_size();
+        let surface = instance.create_surface(&window);
+        (size, surface)
+    };
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference,
             compatible_surface: Some(&surface),
-        },
-        wgpu::BackendBit::PRIMARY,
-    )
-    .await
-    .unwrap();
-
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            extensions: wgpu::Extensions {
-                anisotropic_filtering: false,
-            },
-            limits: wgpu::Limits::default(),
         })
-        .await;
+        .await
+        .expect("No suitable GPU adapters found on the system!");
 
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let adapter_info = adapter.get_info();
+        println!("Using {} ({:?})", adapter_info.name, adapter_info.backend);
+    }
+
+    let optional_features = E::optional_features();
+    let required_features = E::required_features();
+    let adapter_features = adapter.features();
+    assert!(
+        adapter_features.contains(required_features),
+        "Adapter does not support required features for this example: {:?}",
+        required_features - adapter_features
+    );
+
+    let needed_limits = E::required_limits();
+
+    let trace_dir = std::env::var("WGPU_TRACE");
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: None,
+                features: (optional_features & adapter_features) | required_features,
+                limits: needed_limits,
+            },
+            trace_dir.ok().as_ref().map(std::path::Path::new),
+        )
+        .await
+        .expect("Unable to find a suitable GPU adapter!");
+
+    Setup {
+        window,
+        event_loop,
+        instance,
+        size,
+        surface,
+        adapter,
+        device,
+        queue,
+    }
+}
+
+fn start<E: Example>(
+    Setup {
+        window,
+        event_loop,
+        instance,
+        size,
+        surface,
+        adapter,
+        device,
+        queue,
+    }: Setup,
+) {
+    let spawner = Spawner::new();
     let mut sc_desc = wgpu::SwapChainDescriptor {
-        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT,
-        // TODO: Allow srgb unconditionally
-        format: if cfg!(target_arch = "wasm32") {
-            wgpu::TextureFormat::Bgra8Unorm
-        } else {
-            wgpu::TextureFormat::Bgra8UnormSrgb
-        },
+        usage: wgpu::TextureUsage::RENDER_ATTACHMENT,
+        format: adapter.get_swap_chain_preferred_format(&surface),
         width: size.width,
         height: size.height,
         present_mode: wgpu::PresentMode::Mailbox,
@@ -89,32 +210,55 @@ async fn run_async<E: Example>(event_loop: EventLoop<()>, window: Window) {
     let mut swap_chain = device.create_swap_chain(&surface, &sc_desc);
 
     log::info!("Initializing the example...");
-    let (mut example, init_command_buf) = E::init(&sc_desc, &device);
-    if let Some(command_buf) = init_command_buf {
-        queue.submit(&[command_buf]);
-    }
+    let mut example = E::init(&sc_desc, &adapter, &device, &queue);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut last_update_inst = Instant::now();
 
     log::info!("Entering render loop...");
     event_loop.run(move |event, _, control_flow| {
+        let _ = (&instance, &adapter); // force ownership by the closure
         *control_flow = if cfg!(feature = "metal-auto-capture") {
             ControlFlow::Exit
         } else {
             ControlFlow::Poll
         };
         match event {
-            event::Event::MainEventsCleared => window.request_redraw(),
+            event::Event::MainEventsCleared => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    // Clamp to some max framerate to avoid busy-looping too much
+                    // (we might be in wgpu::PresentMode::Mailbox, thus discarding superfluous frames)
+                    //
+                    // winit has window.current_monitor().video_modes() but that is a list of all full screen video modes.
+                    // So without extra dependencies it's a bit tricky to get the max refresh rate we can run the window on.
+                    // Therefore we just go with 60fps - sorry 120hz+ folks!
+                    let target_frametime = Duration::from_secs_f64(1.0 / 60.0);
+                    let time_since_last_frame = last_update_inst.elapsed();
+                    if time_since_last_frame >= target_frametime {
+                        window.request_redraw();
+                        last_update_inst = Instant::now();
+                    } else {
+                        *control_flow = ControlFlow::WaitUntil(
+                            Instant::now() + target_frametime - time_since_last_frame,
+                        );
+                    }
+
+                    spawner.run_until_stalled();
+                }
+
+                #[cfg(target_arch = "wasm32")]
+                window.request_redraw();
+            }
             event::Event::WindowEvent {
                 event: WindowEvent::Resized(size),
                 ..
             } => {
                 log::info!("Resizing to {:?}", size);
-                sc_desc.width = size.width;
-                sc_desc.height = size.height;
+                sc_desc.width = if size.width == 0 { 1 } else { size.width };
+                sc_desc.height = if size.height == 0 { 1 } else { size.height };
+                example.resize(&sc_desc, &device, &queue);
                 swap_chain = device.create_swap_chain(&surface, &sc_desc);
-                let command_buf = example.resize(&sc_desc, &device);
-                if let Some(command_buf) = command_buf {
-                    queue.submit(&[command_buf]);
-                }
             }
             event::Event::WindowEvent { event, .. } => match event {
                 WindowEvent::KeyboardInput {
@@ -134,49 +278,74 @@ async fn run_async<E: Example>(event_loop: EventLoop<()>, window: Window) {
                 }
             },
             event::Event::RedrawRequested(_) => {
-                let frame = swap_chain
-                    .get_next_texture()
-                    .expect("Timeout when acquiring next swap chain texture");
-                let command_buf = example.render(&frame, &device);
-                queue.submit(&[command_buf]);
+                let frame = match swap_chain.get_current_frame() {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        swap_chain = device.create_swap_chain(&surface, &sc_desc);
+                        swap_chain
+                            .get_current_frame()
+                            .expect("Failed to acquire next swap chain texture!")
+                    }
+                };
+
+                example.render(&frame.output, &device, &queue, &spawner);
             }
             _ => {}
         }
     });
 }
 
-pub fn run<E: Example>(title: &str) {
-    let event_loop = EventLoop::new();
-    let mut builder = winit::window::WindowBuilder::new();
-    builder = builder.with_title(title);
-    #[cfg(windows_OFF)] //TODO
-    {
-        use winit::platform::windows::WindowBuilderExtWindows;
-        builder = builder.with_no_redirection_bitmap(true);
-    }
-    let window = builder.build(&event_loop).unwrap();
+#[cfg(not(target_arch = "wasm32"))]
+pub struct Spawner<'a> {
+    executor: async_executor::LocalExecutor<'a>,
+}
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        env_logger::init();
-        futures::executor::block_on(run_async::<E>(event_loop, window));
+#[cfg(not(target_arch = "wasm32"))]
+impl<'a> Spawner<'a> {
+    fn new() -> Self {
+        Self {
+            executor: async_executor::LocalExecutor::new(),
+        }
     }
-    #[cfg(target_arch = "wasm32")]
-    {
-        std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-        console_log::init().expect("could not initialize logger");
-        use winit::platform::web::WindowExtWebSys;
-        // On wasm, append the canvas to the document body
-        web_sys::window()
-            .and_then(|win| win.document())
-            .and_then(|doc| doc.body())
-            .and_then(|body| {
-                body.append_child(&web_sys::Element::from(window.canvas()))
-                    .ok()
-            })
-            .expect("couldn't append canvas to document body");
-        wasm_bindgen_futures::spawn_local(run_async::<E>(event_loop, window));
+
+    #[allow(dead_code)]
+    pub fn spawn_local(&self, future: impl Future<Output = ()> + 'a) {
+        self.executor.spawn(future).detach();
     }
+
+    fn run_until_stalled(&self) {
+        while self.executor.try_tick() {}
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub struct Spawner {}
+
+#[cfg(target_arch = "wasm32")]
+impl Spawner {
+    fn new() -> Self {
+        Self {}
+    }
+
+    #[allow(dead_code)]
+    pub fn spawn_local(&self, future: impl Future<Output = ()> + 'static) {
+        wasm_bindgen_futures::spawn_local(future);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run<E: Example>(title: &str) {
+    let setup = pollster::block_on(setup::<E>(title));
+    start::<E>(setup);
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn run<E: Example>(title: &str) {
+    let title = title.to_owned();
+    wasm_bindgen_futures::spawn_local(async move {
+        let setup = setup::<E>(&title).await;
+        start::<E>(setup);
+    });
 }
 
 // This allows treating the framework as a standalone example,

@@ -1,13 +1,7 @@
 [package]
 name = "wgpu"
-version = "0.5.0"
-authors = [
-    "Dzmitry Malyshau <kvark@mozilla.com>",
-    "Joshua Groves <josh@joshgroves.com>",
-    "Lucas Kent <rubickent@gmail.com>",
-    "kyren <kerriganw@gmail.com>",
-    "Cormac O'Brien <cormac@c-obrien.org>",
-]
+version = "0.7.0"
+authors = ["wgpu developers"]
 edition = "2018"
 description = "Rusty WebGPU API wrapper"
 homepage = "https://github.com/gfx-rs/wgpu-rs"
@@ -16,73 +10,99 @@ keywords = ["graphics"]
 license = "MPL-2.0"
 exclude = ["etc/**/*", "examples/**/*", "tests/**/*", "Cargo.lock", "target/**/*"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lib]
 
 [features]
 default = []
+trace = ["serde", "wgc/trace"]
+replay = ["serde", "wgc/replay"]
 # Make Vulkan backend available on platforms where it is by default not, e.g. macOS
-vulkan = ["wgn/vulkan-portability"]
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.wgn]
-package = "wgpu-native"
-version = "0.5"
-git = "https://github.com/gfx-rs/wgpu"
-rev = "49dbe08f37f8396cff0d6672667a48116ec487f5"
+vulkan-portability = ["wgc/gfx-backend-vulkan"]
+webgl = ["wgc"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.wgc]
 package = "wgpu-core"
-version = "0.5"
 git = "https://github.com/gfx-rs/wgpu"
-rev = "49dbe08f37f8396cff0d6672667a48116ec487f5"
+rev = "7c7501cab72fd01b14def06b9d9bc63a8dd44b45"
+features = ["raw-window-handle"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.wgc]
+package = "wgpu-core"
+git = "https://github.com/gfx-rs/wgpu"
+rev = "7c7501cab72fd01b14def06b9d9bc63a8dd44b45"
+features = ["raw-window-handle"]
+optional = true
 
 [dependencies.wgt]
 package = "wgpu-types"
-version = "0.5"
 git = "https://github.com/gfx-rs/wgpu"
-rev = "49dbe08f37f8396cff0d6672667a48116ec487f5"
+rev = "7c7501cab72fd01b14def06b9d9bc63a8dd44b45"
 
 [dependencies]
 arrayvec = "0.5"
-smallvec = "1"
+parking_lot = "0.11"
 raw-window-handle = "0.3"
-parking_lot = "0.10"
+smallvec = "1"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
-cgmath = "0.17"
+bytemuck = { version = "1.4", features = ["derive"] }
+cgmath = "0.18"
+ddsfile = "0.4"
 log = "0.4"
-png = "0.15"
-winit = { version = "0.22.1", features = ["web-sys"] }
+naga = { git = "https://github.com/gfx-rs/naga", tag = "gfx-9", features = ["wgsl-in"] }
+noise = "0.7"
+png = "0.16"
 rand = { version = "0.7.2", features = ["wasm-bindgen"] }
-bytemuck = "1"
-futures = "0.3"
+winit = { version = "0.24.0", features = ["web-sys"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+async-executor = "1.0"
+pollster = "0.2"
+wgpu-subscriber = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.naga]
+git = "https://github.com/gfx-rs/naga"
+tag = "gfx-9"
+features = ["wgsl-in", "spv-out"]
 
 [[example]]
 name="hello-compute"
 path="examples/hello-compute/main.rs"
 test = true
 
-[patch.crates-io]
-#wgpu-types = { version = "0.5.0", path = "../wgpu/wgpu-types" }
-#wgpu-core = { version = "0.5.0", path = "../wgpu/wgpu-core" }
-#wgpu-native = { version = "0.5.0", path = "../wgpu/wgpu-native" }
-#gfx-hal = { version = "0.5.0", path = "../gfx/src/hal" }
-#gfx-backend-empty = { version = "0.5.0", path = "../gfx/src/backend/empty" }
-#gfx-backend-vulkan = { version = "0.5.0", path = "../gfx/src/backend/vulkan" }
-#gfx-backend-dx12 = { version = "0.5.0", path = "../gfx/src/backend/dx12" }
-#gfx-backend-dx11 = { version = "0.5.0", path = "../gfx/src/backend/dx11" }
-#gfx-descriptor = { version = "0.1.0", path = "../gfx-extras/gfx-descriptor" }
-#gfx-memory = { version = "0.1.0", path = "../gfx-extras/gfx-memory" }
-wasm-bindgen = { git = "https://github.com/rustwasm/wasm-bindgen" }
-wasm-bindgen-futures = { git = "https://github.com/rustwasm/wasm-bindgen" }
-web-sys = { git = "https://github.com/rustwasm/wasm-bindgen" }
-js-sys = { git = "https://github.com/rustwasm/wasm-bindgen" }
+[patch."https://github.com/gfx-rs/wgpu"]
+#wgpu-types = { version = "0.6", path = "../wgpu/wgpu-types" }
+#wgpu-core = { version = "0.6", path = "../wgpu/wgpu-core" }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-env_logger = "0.7"
+[patch."https://github.com/gfx-rs/subscriber"]
+#wgpu-subscriber = { version = "0.1", path = "../subscriber" }
+
+[patch."https://github.com/gfx-rs/naga"]
+#naga = { path = "../naga" }
+
+[patch."https://github.com/zakarumych/gpu-descriptor"]
+#gpu-descriptor = { path = "../gpu-descriptor/gpu-descriptor" }
+
+[patch."https://github.com/zakarumych/gpu-alloc"]
+#gpu-alloc = { path = "../gpu-alloc/gpu-alloc" }
+
+[patch."https://github.com/gfx-rs/gfx"]
+#gfx-hal = { path = "../gfx/src/hal" }
+#gfx-backend-empty = { path = "../gfx/src/backend/empty" }
+#gfx-backend-vulkan = { path = "../gfx/src/backend/vulkan" }
+#gfx-backend-gl = { path = "../gfx/src/backend/gl" }
+#gfx-backend-dx12 = { path = "../gfx/src/backend/dx12" }
+#gfx-backend-dx11 = { path = "../gfx/src/backend/dx11" }
+#gfx-backend-metal = { path = "../gfx/src/backend/metal" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2.60"
-web-sys = { version = "0.3.37", features = [
+wasm-bindgen = "=0.2.69" # remember to change version in readme as well
+web-sys = { version = "=0.3.46", features = [
     "Document",
     "Navigator",
     "Node",
@@ -127,6 +147,7 @@ web-sys = { version = "0.3.37", features = [
     "GpuInputStepMode",
     "GpuLimits",
     "GpuLoadOp",
+    "GpuMapMode",
     "GpuOrigin3dDict",
     "GpuPipelineLayout",
     "GpuPipelineLayoutDescriptor",
@@ -135,6 +156,10 @@ web-sys = { version = "0.3.37", features = [
     "GpuProgrammableStageDescriptor",
     "GpuQueue",
     "GpuRasterizationStateDescriptor",
+    "GpuRenderBundle",
+    "GpuRenderBundleDescriptor",
+    "GpuRenderBundleEncoder",
+    "GpuRenderBundleEncoderDescriptor",
     "GpuRenderPassColorAttachmentDescriptor",
     "GpuRenderPassDepthStencilAttachmentDescriptor",
     "GpuRenderPassDescriptor",
@@ -155,6 +180,7 @@ web-sys = { version = "0.3.37", features = [
     "GpuTextureAspect",
     "GpuTextureComponentType",
     "GpuTextureCopyView",
+    "GpuTextureDataLayout",
     "GpuTextureDescriptor",
     "GpuTextureDimension",
     "GpuTextureFormat",
@@ -169,8 +195,8 @@ web-sys = { version = "0.3.37", features = [
     "HtmlCanvasElement",
     "Window",
 ]}
-js-sys = "0.3.37"
-wasm-bindgen-futures = "0.4.10"
+js-sys = "0.3.46"
+wasm-bindgen-futures = "0.4.19"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 console_error_panic_hook = "0.1.6"

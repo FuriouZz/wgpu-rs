@@ -2,20 +2,19 @@
 mod framework;
 
 use bytemuck::{Pod, Zeroable};
-
-use wgpu::vertex_attr_array;
+use std::{borrow::Cow, mem, num::NonZeroU32};
+use wgpu::util::DeviceExt;
 
 const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+const MIP_LEVEL_COUNT: u32 = 9;
+const MIP_PASS_COUNT: u32 = MIP_LEVEL_COUNT - 1;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
     #[allow(dead_code)]
     pos: [f32; 4],
 }
-
-unsafe impl Pod for Vertex {}
-unsafe impl Zeroable for Vertex {}
 
 fn create_vertices() -> Vec<Vertex> {
     vec![
@@ -57,6 +56,27 @@ fn create_texels(size: usize, cx: f32, cy: f32) -> Vec<u8> {
         .collect()
 }
 
+struct QuerySets {
+    timestamp: wgpu::QuerySet,
+    timestamp_period: f32,
+    pipeline_statistics: wgpu::QuerySet,
+    data_buffer: wgpu::Buffer,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TimestampData {
+    start: u64,
+    end: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct QueryData {
+    timestamps: [TimestampData; MIP_PASS_COUNT as usize],
+    pipeline_queries: [u64; MIP_PASS_COUNT as usize],
+}
+
 struct Example {
     vertex_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -67,7 +87,7 @@ struct Example {
 impl Example {
     fn generate_matrix(aspect_ratio: f32) -> cgmath::Matrix4<f32> {
         let mx_projection = cgmath::perspective(cgmath::Deg(45f32), aspect_ratio, 1.0, 1000.0);
-        let mx_view = cgmath::Matrix4::look_at(
+        let mx_view = cgmath::Matrix4::look_at_rh(
             cgmath::Point3::new(0f32, 0.0, 10.0),
             cgmath::Point3::new(0f32, 50.0, 0.0),
             cgmath::Vector3::unit_z(),
@@ -80,94 +100,61 @@ impl Example {
         encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
         texture: &wgpu::Texture,
+        query_sets: &Option<QuerySets>,
         mip_count: u32,
+        shader_flags: wgpu::ShaderFlags,
     ) {
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            bindings: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: wgpu::BindingType::SampledTexture {
-                        multisampled: false,
-                        component_type: wgpu::TextureComponentType::Float,
-                        dimension: wgpu::TextureViewDimension::D2,
-                    },
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler { comparison: false },
-                },
-            ],
+        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
             label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("blit.wgsl"))),
+            flags: shader_flags,
         });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            bind_group_layouts: &[&bind_group_layout],
-        });
-
-        let vs_bytes = include_bytes!("blit.vert.spv");
-        let fs_bytes = include_bytes!("blit.frag.spv");
-        let vs_module = device
-            .create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&vs_bytes[..])).unwrap());
-        let fs_module = device
-            .create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&fs_bytes[..])).unwrap());
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            layout: &pipeline_layout,
-            vertex_stage: wgpu::ProgrammableStageDescriptor {
-                module: &vs_module,
-                entry_point: "main",
+            label: Some("blit"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
             },
-            fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
-                module: &fs_module,
-                entry_point: "main",
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[TEXTURE_FORMAT.into()],
             }),
-            rasterization_state: Some(wgpu::RasterizationStateDescriptor {
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: wgpu::CullMode::None,
-                depth_bias: 0,
-                depth_bias_slope_scale: 0.0,
-                depth_bias_clamp: 0.0,
-            }),
-            primitive_topology: wgpu::PrimitiveTopology::TriangleStrip,
-            color_states: &[wgpu::ColorStateDescriptor {
-                format: TEXTURE_FORMAT,
-                color_blend: wgpu::BlendDescriptor::REPLACE,
-                alpha_blend: wgpu::BlendDescriptor::REPLACE,
-                write_mask: wgpu::ColorWrite::ALL,
-            }],
-            depth_stencil_state: None,
-            vertex_state: wgpu::VertexStateDescriptor {
-                index_format: wgpu::IndexFormat::Uint16,
-                vertex_buffers: &[],
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
             },
-            sample_count: 1,
-            sample_mask: !0,
-            alpha_to_coverage_enabled: false,
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
         });
 
+        let bind_group_layout = pipeline.get_bind_group_layout(0);
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("mip"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::FilterMode::Nearest,
-            lod_min_clamp: 0.0,
-            lod_max_clamp: 100.0,
-            compare: wgpu::CompareFunction::Undefined,
+            ..Default::default()
         });
 
         let views = (0..mip_count)
             .map(|mip| {
                 texture.create_view(&wgpu::TextureViewDescriptor {
-                    format: TEXTURE_FORMAT,
-                    dimension: wgpu::TextureViewDimension::D2,
+                    label: Some("mip"),
+                    format: None,
+                    dimension: None,
                     aspect: wgpu::TextureAspect::All,
                     base_mip_level: mip,
-                    level_count: 1,
+                    level_count: NonZeroU32::new(1),
                     base_array_layer: 0,
-                    array_layer_count: 1,
+                    array_layer_count: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -175,12 +162,12 @@ impl Example {
         for target_mip in 1..mip_count as usize {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 layout: &bind_group_layout,
-                bindings: &[
-                    wgpu::Binding {
+                entries: &[
+                    wgpu::BindGroupEntry {
                         binding: 0,
                         resource: wgpu::BindingResource::TextureView(&views[target_mip - 1]),
                     },
-                    wgpu::Binding {
+                    wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(&sampler),
                     },
@@ -188,73 +175,80 @@ impl Example {
                 label: None,
             });
 
+            let pipeline_query_index_base = target_mip as u32 - 1;
+            let timestamp_query_index_base = (target_mip as u32 - 1) * 2;
+
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
                 color_attachments: &[wgpu::RenderPassColorAttachmentDescriptor {
                     attachment: &views[target_mip],
                     resolve_target: None,
-                    load_op: wgpu::LoadOp::Clear,
-                    store_op: wgpu::StoreOp::Store,
-                    clear_color: wgpu::Color::WHITE,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: true,
+                    },
                 }],
                 depth_stencil_attachment: None,
             });
+            if let Some(ref query_sets) = query_sets {
+                rpass.write_timestamp(&query_sets.timestamp, timestamp_query_index_base);
+                rpass.begin_pipeline_statistics_query(
+                    &query_sets.pipeline_statistics,
+                    pipeline_query_index_base,
+                );
+            }
             rpass.set_pipeline(&pipeline);
             rpass.set_bind_group(0, &bind_group, &[]);
             rpass.draw(0..4, 0..1);
+            if let Some(ref query_sets) = query_sets {
+                rpass.write_timestamp(&query_sets.timestamp, timestamp_query_index_base + 1);
+                rpass.end_pipeline_statistics_query();
+            }
+        }
+
+        if let Some(ref query_sets) = query_sets {
+            let timestamp_query_count = MIP_PASS_COUNT * 2;
+            encoder.resolve_query_set(
+                &query_sets.timestamp,
+                0..timestamp_query_count,
+                &query_sets.data_buffer,
+                0,
+            );
+            encoder.resolve_query_set(
+                &query_sets.pipeline_statistics,
+                0..MIP_PASS_COUNT,
+                &query_sets.data_buffer,
+                (timestamp_query_count * mem::size_of::<u64>() as u32) as wgpu::BufferAddress,
+            );
         }
     }
 }
 
 impl framework::Example for Example {
+    fn optional_features() -> wgpu::Features {
+        wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::PIPELINE_STATISTICS_QUERY
+    }
+
     fn init(
         sc_desc: &wgpu::SwapChainDescriptor,
+        adapter: &wgpu::Adapter,
         device: &wgpu::Device,
-    ) -> (Self, Option<wgpu::CommandBuffer>) {
-        use std::mem;
-
+        queue: &wgpu::Queue,
+    ) -> Self {
         let mut init_encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         // Create the vertex and index buffers
         let vertex_size = mem::size_of::<Vertex>();
         let vertex_data = create_vertices();
-        let vertex_buf = device.create_buffer_with_data(
-            bytemuck::cast_slice(&vertex_data),
-            wgpu::BufferUsage::VERTEX,
-        );
-
-        // Create pipeline layout
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            bindings: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStage::VERTEX,
-                    ty: wgpu::BindingType::UniformBuffer { dynamic: false },
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: wgpu::BindingType::SampledTexture {
-                        component_type: wgpu::TextureComponentType::Float,
-                        multisampled: false,
-                        dimension: wgpu::TextureViewDimension::D2,
-                    },
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler { comparison: false },
-                },
-            ],
-            label: None,
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            bind_group_layouts: &[&bind_group_layout],
+        let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertex_data),
+            usage: wgpu::BufferUsage::VERTEX,
         });
 
         // Create the texture
-        let mip_level_count = 9;
-        let size = 1 << mip_level_count;
+        let size = 1 << MIP_LEVEL_COUNT;
         let texels = create_texels(size as usize, -0.8, 0.156);
         let texture_extent = wgpu::Extent3d {
             width: size,
@@ -263,29 +257,35 @@ impl framework::Example for Example {
         };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             size: texture_extent,
-            mip_level_count,
+            mip_level_count: MIP_LEVEL_COUNT,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: TEXTURE_FORMAT,
             usage: wgpu::TextureUsage::SAMPLED
-                | wgpu::TextureUsage::OUTPUT_ATTACHMENT
+                | wgpu::TextureUsage::RENDER_ATTACHMENT
                 | wgpu::TextureUsage::COPY_DST,
             label: None,
         });
-        let texture_view = texture.create_default_view();
-        let temp_buf =
-            device.create_buffer_with_data(texels.as_slice(), wgpu::BufferUsage::COPY_SRC);
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        //Note: we could use queue.write_texture instead, and this is what other
+        // examples do, but here we want to show another way to do this.
+        let temp_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Temporary Buffer"),
+            contents: texels.as_slice(),
+            usage: wgpu::BufferUsage::COPY_SRC,
+        });
         init_encoder.copy_buffer_to_texture(
             wgpu::BufferCopyView {
                 buffer: &temp_buf,
-                offset: 0,
-                bytes_per_row: 4 * size,
-                rows_per_image: 0,
+                layout: wgpu::TextureDataLayout {
+                    offset: 0,
+                    bytes_per_row: 4 * size,
+                    rows_per_image: 0,
+                },
             },
             wgpu::TextureCopyView {
                 texture: &texture,
                 mip_level: 0,
-                array_layer: 0,
                 origin: wgpu::Origin3d::ZERO,
             },
             texture_extent,
@@ -293,39 +293,78 @@ impl framework::Example for Example {
 
         // Create other resources
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: None,
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Linear,
-            lod_min_clamp: 0.0,
-            lod_max_clamp: 100.0,
-            compare: wgpu::CompareFunction::Undefined,
+            ..Default::default()
         });
         let mx_total = Self::generate_matrix(sc_desc.width as f32 / sc_desc.height as f32);
         let mx_ref: &[f32; 16] = mx_total.as_ref();
-        let uniform_buf = device.create_buffer_with_data(
-            bytemuck::cast_slice(mx_ref),
-            wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
-        );
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Uniform Buffer"),
+            contents: bytemuck::cast_slice(mx_ref),
+            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+        });
+
+        // Create the render pipeline
+        let mut flags = wgpu::ShaderFlags::VALIDATION;
+        match adapter.get_info().backend {
+            wgpu::Backend::Metal | wgpu::Backend::Vulkan => {
+                flags |= wgpu::ShaderFlags::EXPERIMENTAL_TRANSLATION
+            }
+            _ => (), //TODO
+        }
+        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("draw.wgsl"))),
+            flags,
+        });
+
+        let draw_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("draw"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: vertex_size as wgpu::BufferAddress,
+                    step_mode: wgpu::InputStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float4],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[sc_desc.format.into()],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: wgpu::CullMode::Back,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+        });
 
         // Create bind group
+        let bind_group_layout = draw_pipeline.get_bind_group_layout(0);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &bind_group_layout,
-            bindings: &[
-                wgpu::Binding {
+            entries: &[
+                wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::Buffer {
-                        buffer: &uniform_buf,
-                        range: 0..64,
-                    },
+                    resource: uniform_buf.as_entire_binding(),
                 },
-                wgpu::Binding {
+                wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&texture_view),
                 },
-                wgpu::Binding {
+                wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
@@ -333,62 +372,103 @@ impl framework::Example for Example {
             label: None,
         });
 
-        // Create the render pipeline
-        let vs_bytes = include_bytes!("draw.vert.spv");
-        let fs_bytes = include_bytes!("draw.frag.spv");
-        let vs_module = device
-            .create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&vs_bytes[..])).unwrap());
-        let fs_module = device
-            .create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&fs_bytes[..])).unwrap());
+        // If both kinds of query are supported, use queries
+        let query_sets = if device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::PIPELINE_STATISTICS_QUERY)
+        {
+            // For N total mips, it takes N - 1 passes to generate them, and we're measuring those.
+            let mip_passes = MIP_LEVEL_COUNT - 1;
 
-        let draw_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            layout: &pipeline_layout,
-            vertex_stage: wgpu::ProgrammableStageDescriptor {
-                module: &vs_module,
-                entry_point: "main",
-            },
-            fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
-                module: &fs_module,
-                entry_point: "main",
-            }),
-            rasterization_state: Some(wgpu::RasterizationStateDescriptor {
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: wgpu::CullMode::Back,
-                depth_bias: 0,
-                depth_bias_slope_scale: 0.0,
-                depth_bias_clamp: 0.0,
-            }),
-            primitive_topology: wgpu::PrimitiveTopology::TriangleStrip,
-            color_states: &[wgpu::ColorStateDescriptor {
-                format: sc_desc.format,
-                color_blend: wgpu::BlendDescriptor::REPLACE,
-                alpha_blend: wgpu::BlendDescriptor::REPLACE,
-                write_mask: wgpu::ColorWrite::ALL,
-            }],
-            depth_stencil_state: None,
-            vertex_state: wgpu::VertexStateDescriptor {
-                index_format: wgpu::IndexFormat::Uint16,
-                vertex_buffers: &[wgpu::VertexBufferDescriptor {
-                    stride: vertex_size as wgpu::BufferAddress,
-                    step_mode: wgpu::InputStepMode::Vertex,
-                    attributes: &vertex_attr_array![0 => Float4],
-                }],
-            },
-            sample_count: 1,
-            sample_mask: !0,
-            alpha_to_coverage_enabled: false,
-        });
+            // Create the timestamp query set. We need twice as many queries as we have passes,
+            // as we need a query at the beginning and at the end of the operation.
+            let timestamp = device.create_query_set(&wgpu::QuerySetDescriptor {
+                count: mip_passes * 2,
+                ty: wgpu::QueryType::Timestamp,
+            });
+            // Timestamp queries use an device-specific timestamp unit. We need to figure out how many
+            // nanoseconds go by for the timestamp to be incremented by one. The period is this value.
+            let timestamp_period = queue.get_timestamp_period();
 
-        // Done
-        Self::generate_mipmaps(&mut init_encoder, &device, &texture, mip_level_count);
+            // We only need one pipeline statistics query per pass.
+            let pipeline_statistics = device.create_query_set(&wgpu::QuerySetDescriptor {
+                count: mip_passes,
+                ty: wgpu::QueryType::PipelineStatistics(
+                    wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
+                ),
+            });
 
-        let this = Example {
+            // This databuffer has to store all of the query results, 2 * passes timestamp queries
+            // and 1 * passes statistics queries. Each query returns a u64 value.
+            let data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("query buffer"),
+                size: mip_passes as wgpu::BufferAddress
+                    * 3
+                    * mem::size_of::<u64>() as wgpu::BufferAddress,
+                usage: wgpu::BufferUsage::COPY_DST | wgpu::BufferUsage::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            Some(QuerySets {
+                timestamp,
+                timestamp_period,
+                pipeline_statistics,
+                data_buffer,
+            })
+        } else {
+            None
+        };
+
+        Self::generate_mipmaps(
+            &mut init_encoder,
+            &device,
+            &texture,
+            &query_sets,
+            MIP_LEVEL_COUNT,
+            flags,
+        );
+
+        queue.submit(Some(init_encoder.finish()));
+        if let Some(ref query_sets) = query_sets {
+            // We can ignore the future as we're about to wait for the device.
+            let _ = query_sets
+                .data_buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read);
+            // Wait for device to be done rendering mipmaps
+            device.poll(wgpu::Maintain::Wait);
+            // This is guaranteed to be ready.
+            let view = query_sets.data_buffer.slice(..).get_mapped_range();
+            // Convert the raw data into a useful structure
+            let data: &QueryData = bytemuck::from_bytes(&*view);
+            // Iterate over the data
+            for (idx, (timestamp, pipeline)) in data
+                .timestamps
+                .iter()
+                .zip(data.pipeline_queries.iter())
+                .enumerate()
+            {
+                // Figure out the timestamp differences and multiply by the period to get nanoseconds
+                let nanoseconds =
+                    (timestamp.end - timestamp.start) as f32 * query_sets.timestamp_period;
+                // Nanoseconds is a bit small, so lets use microseconds.
+                let microseconds = nanoseconds / 1000.0;
+                // Print the data!
+                println!(
+                    "Generating mip level {} took {:.3} μs and called the fragment shader {} times",
+                    idx + 1,
+                    microseconds,
+                    pipeline
+                );
+            }
+        }
+
+        Example {
             vertex_buf,
             bind_group,
             uniform_buf,
             draw_pipeline,
-        };
-        (this, Some(init_encoder.finish()))
+        }
     }
 
     fn update(&mut self, _event: winit::event::WindowEvent) {
@@ -398,50 +478,49 @@ impl framework::Example for Example {
     fn resize(
         &mut self,
         sc_desc: &wgpu::SwapChainDescriptor,
-        device: &wgpu::Device,
-    ) -> Option<wgpu::CommandBuffer> {
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
         let mx_total = Self::generate_matrix(sc_desc.width as f32 / sc_desc.height as f32);
         let mx_ref: &[f32; 16] = mx_total.as_ref();
-
-        let temp_buf = device
-            .create_buffer_with_data(bytemuck::cast_slice(mx_ref), wgpu::BufferUsage::COPY_SRC);
-
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.copy_buffer_to_buffer(&temp_buf, 0, &self.uniform_buf, 0, 64);
-        Some(encoder.finish())
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(mx_ref));
     }
 
     fn render(
         &mut self,
-        frame: &wgpu::SwapChainOutput,
+        frame: &wgpu::SwapChainTexture,
         device: &wgpu::Device,
-    ) -> wgpu::CommandBuffer {
+        queue: &wgpu::Queue,
+        _spawner: &framework::Spawner,
+    ) {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
+            let clear_color = wgpu::Color {
+                r: 0.1,
+                g: 0.2,
+                b: 0.3,
+                a: 1.0,
+            };
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
                 color_attachments: &[wgpu::RenderPassColorAttachmentDescriptor {
                     attachment: &frame.view,
                     resolve_target: None,
-                    load_op: wgpu::LoadOp::Clear,
-                    store_op: wgpu::StoreOp::Store,
-                    clear_color: wgpu::Color {
-                        r: 0.1,
-                        g: 0.2,
-                        b: 0.3,
-                        a: 1.0,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear_color),
+                        store: true,
                     },
                 }],
                 depth_stencil_attachment: None,
             });
             rpass.set_pipeline(&self.draw_pipeline);
             rpass.set_bind_group(0, &self.bind_group, &[]);
-            rpass.set_vertex_buffer(0, &self.vertex_buf, 0, 0);
+            rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
             rpass.draw(0..4, 0..1);
         }
 
-        encoder.finish()
+        queue.submit(Some(encoder.finish()));
     }
 }
 

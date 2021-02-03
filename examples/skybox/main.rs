@@ -1,10 +1,20 @@
 #[path = "../framework.rs"]
 mod framework;
 
-const SKYBOX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+use std::borrow::Cow;
+use wgpu::util::DeviceExt;
+
+const IMAGE_SIZE: u32 = 128;
 
 type Uniform = cgmath::Matrix4<f32>;
 type Uniforms = [Uniform; 2];
+
+fn raw_uniforms(uniforms: &Uniforms) -> [f32; 16 * 2] {
+    let mut raw = [0f32; 16 * 2];
+    raw[..16].copy_from_slice(&AsRef::<[f32; 16]>::as_ref(&uniforms[0])[..]);
+    raw[16..].copy_from_slice(&AsRef::<[f32; 16]>::as_ref(&uniforms[1])[..]);
+    raw
+}
 
 pub struct Skybox {
     aspect: f32,
@@ -12,252 +22,220 @@ pub struct Skybox {
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
     uniforms: Uniforms,
+    staging_belt: wgpu::util::StagingBelt,
 }
 
 impl Skybox {
     fn generate_uniforms(aspect_ratio: f32) -> Uniforms {
+        use cgmath::SquareMatrix;
+
         let mx_projection = cgmath::perspective(cgmath::Deg(45f32), aspect_ratio, 1.0, 10.0);
-        let mx_view = cgmath::Matrix4::look_at(
+        let mx_view = cgmath::Matrix4::look_at_rh(
             cgmath::Point3::new(1.5f32, -5.0, 3.0),
             cgmath::Point3::new(0f32, 0.0, 0.0),
             cgmath::Vector3::unit_z(),
         );
         let mx_correction = framework::OPENGL_TO_WGPU_MATRIX;
-        [mx_correction * mx_projection, mx_correction * mx_view]
+        let proj_inv = (mx_correction * mx_projection).invert().unwrap();
+        [proj_inv, mx_correction * mx_view]
     }
-}
-
-fn buffer_from_uniforms(
-    device: &wgpu::Device,
-    uniforms: &Uniforms,
-    usage: wgpu::BufferUsage,
-) -> wgpu::Buffer {
-    let mut uniform_buf = device.create_buffer_mapped(&wgpu::BufferDescriptor {
-        size: std::mem::size_of::<Uniforms>() as u64,
-        usage,
-        label: None,
-    });
-    // FIXME: Align and use `LayoutVerified`
-    for (u, slot) in uniforms.iter().zip(
-        uniform_buf
-            .data()
-            .chunks_exact_mut(std::mem::size_of::<Uniform>()),
-    ) {
-        slot.copy_from_slice(bytemuck::cast_slice(AsRef::<[[f32; 4]; 4]>::as_ref(u)));
-    }
-    uniform_buf.finish()
 }
 
 impl framework::Example for Skybox {
+    fn optional_features() -> wgpu::Features {
+        wgpu::Features::TEXTURE_COMPRESSION_ASTC_LDR
+            | wgpu::Features::TEXTURE_COMPRESSION_ETC2
+            | wgpu::Features::TEXTURE_COMPRESSION_BC
+    }
+
     fn init(
         sc_desc: &wgpu::SwapChainDescriptor,
+        adapter: &wgpu::Adapter,
         device: &wgpu::Device,
-    ) -> (Self, Option<wgpu::CommandBuffer>) {
-        let mut init_encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
+        queue: &wgpu::Queue,
+    ) -> Self {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            bindings: &[
+            label: None,
+            entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStage::VERTEX | wgpu::ShaderStage::FRAGMENT,
-                    ty: wgpu::BindingType::UniformBuffer { dynamic: false },
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: wgpu::BindingType::SampledTexture {
-                        component_type: wgpu::TextureComponentType::Float,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         multisampled: false,
-                        dimension: wgpu::TextureViewDimension::Cube,
+                        view_dimension: wgpu::TextureViewDimension::Cube,
                     },
+                    count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler { comparison: false },
+                    ty: wgpu::BindingType::Sampler {
+                        comparison: false,
+                        filtering: true,
+                    },
+                    count: None,
                 },
             ],
-            label: None,
         });
 
         // Create the render pipeline
-        let vs_bytes = include_bytes!("shader.vert.spv");
-        let fs_bytes = include_bytes!("shader.frag.spv");
-        let vs_module = device
-            .create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&vs_bytes[..])).unwrap());
-        let fs_module = device
-            .create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&fs_bytes[..])).unwrap());
+        let mut flags = wgpu::ShaderFlags::VALIDATION;
+        match adapter.get_info().backend {
+            wgpu::Backend::Metal | wgpu::Backend::Vulkan => {
+                flags |= wgpu::ShaderFlags::EXPERIMENTAL_TRANSLATION
+            }
+            _ => (), //TODO
+        }
+        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
+            flags,
+        });
 
         let aspect = sc_desc.width as f32 / sc_desc.height as f32;
         let uniforms = Self::generate_uniforms(aspect);
-        let uniform_buf = buffer_from_uniforms(
-            &device,
-            &uniforms,
-            wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
-        );
-        let uniform_buf_size = std::mem::size_of::<Uniforms>();
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Buffer"),
+            contents: bytemuck::cast_slice(&raw_uniforms(&uniforms)),
+            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
             bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
         });
 
         // Create the render pipeline
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            layout: &pipeline_layout,
-            vertex_stage: wgpu::ProgrammableStageDescriptor {
-                module: &vs_module,
-                entry_point: "main",
+            label: None,
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
             },
-            fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
-                module: &fs_module,
-                entry_point: "main",
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[sc_desc.format.into()],
             }),
-            rasterization_state: Some(wgpu::RasterizationStateDescriptor {
+            primitive: wgpu::PrimitiveState {
                 front_face: wgpu::FrontFace::Cw,
-                cull_mode: wgpu::CullMode::None,
-                depth_bias: 0,
-                depth_bias_slope_scale: 0.0,
-                depth_bias_clamp: 0.0,
-            }),
-            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
-            color_states: &[wgpu::ColorStateDescriptor {
-                format: sc_desc.format,
-                color_blend: wgpu::BlendDescriptor::REPLACE,
-                alpha_blend: wgpu::BlendDescriptor::REPLACE,
-                write_mask: wgpu::ColorWrite::ALL,
-            }],
-            vertex_state: wgpu::VertexStateDescriptor {
-                index_format: wgpu::IndexFormat::Uint16,
-                vertex_buffers: &[],
+                ..Default::default()
             },
-            depth_stencil_state: None,
-            sample_count: 1,
-            sample_mask: !0,
-            alpha_to_coverage_enabled: false,
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: None,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            lod_min_clamp: 0.0,
-            lod_max_clamp: 100.0,
-            compare: wgpu::CompareFunction::Undefined,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         });
 
-        let paths: [&'static [u8]; 6] = [
-            &include_bytes!("images/posx.png")[..],
-            &include_bytes!("images/negx.png")[..],
-            &include_bytes!("images/posy.png")[..],
-            &include_bytes!("images/negy.png")[..],
-            &include_bytes!("images/posz.png")[..],
-            &include_bytes!("images/negz.png")[..],
-        ];
+        let device_features = device.features();
 
-        // we set these multiple times, but whatever
-        let (mut image_width, mut image_height) = (0, 0);
-        let faces = paths
-            .iter()
-            .map(|png| {
-                let png = std::io::Cursor::new(png);
-                let decoder = png::Decoder::new(png);
-                let (info, mut reader) = decoder.read_info().expect("can read info");
-                image_width = info.width;
-                image_height = info.height;
-                let mut buf = vec![0; info.buffer_size()];
-                reader.next_frame(&mut buf).expect("can read png frame");
-                buf
-            })
-            .collect::<Vec<_>>();
+        let skybox_format =
+            if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC_LDR) {
+                wgpu::TextureFormat::Astc4x4RgbaUnormSrgb
+            } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {
+                wgpu::TextureFormat::Etc2RgbUnormSrgb
+            } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
+                wgpu::TextureFormat::Bc1RgbaUnormSrgb
+            } else {
+                wgpu::TextureFormat::Bgra8UnormSrgb
+            };
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            size: wgpu::Extent3d {
-                width: image_width,
-                height: image_height,
-                depth: 6,
+        let size = wgpu::Extent3d {
+            width: IMAGE_SIZE,
+            height: IMAGE_SIZE,
+            depth: 6,
+        };
+
+        let layer_size = wgpu::Extent3d { depth: 1, ..size };
+        let max_mips = layer_size.max_mips();
+
+        log::debug!(
+            "Copying {:?} skybox images of size {}, {}, 6 with {} mips to gpu",
+            skybox_format,
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+            max_mips,
+        );
+
+        let bytes = match skybox_format {
+            wgpu::TextureFormat::Astc4x4RgbaUnormSrgb => &include_bytes!("images/astc.dds")[..],
+            wgpu::TextureFormat::Etc2RgbUnormSrgb => &include_bytes!("images/etc2.dds")[..],
+            wgpu::TextureFormat::Bc1RgbaUnormSrgb => &include_bytes!("images/bc1.dds")[..],
+            wgpu::TextureFormat::Bgra8UnormSrgb => &include_bytes!("images/bgra.dds")[..],
+            _ => unreachable!(),
+        };
+
+        let image = ddsfile::Dds::read(&mut std::io::Cursor::new(&bytes)).unwrap();
+
+        let texture = device.create_texture_with_data(
+            &queue,
+            &wgpu::TextureDescriptor {
+                size,
+                mip_level_count: max_mips as u32,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: skybox_format,
+                usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::COPY_DST,
+                label: None,
             },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: SKYBOX_FORMAT,
-            usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::COPY_DST,
-            label: None,
-        });
-
-        for (i, image) in faces.iter().enumerate() {
-            log::debug!(
-                "Copying skybox image {} of size {},{} to gpu",
-                i,
-                image_width,
-                image_height,
-            );
-            let image_buf = device.create_buffer_with_data(image, wgpu::BufferUsage::COPY_SRC);
-
-            init_encoder.copy_buffer_to_texture(
-                wgpu::BufferCopyView {
-                    buffer: &image_buf,
-                    offset: 0,
-                    bytes_per_row: 4 * image_width,
-                    rows_per_image: 0,
-                },
-                wgpu::TextureCopyView {
-                    texture: &texture,
-                    mip_level: 0,
-                    array_layer: i as u32,
-                    origin: wgpu::Origin3d::ZERO,
-                },
-                wgpu::Extent3d {
-                    width: image_width,
-                    height: image_height,
-                    depth: 1,
-                },
-            );
-        }
+            &image.data,
+        );
 
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor {
-            format: SKYBOX_FORMAT,
-            dimension: wgpu::TextureViewDimension::Cube,
-            aspect: wgpu::TextureAspect::default(),
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            array_layer_count: 6,
+            label: None,
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..wgpu::TextureViewDescriptor::default()
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &bind_group_layout,
-            bindings: &[
-                wgpu::Binding {
+            entries: &[
+                wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::Buffer {
-                        buffer: &uniform_buf,
-                        range: 0..uniform_buf_size as wgpu::BufferAddress,
-                    },
+                    resource: uniform_buf.as_entire_binding(),
                 },
-                wgpu::Binding {
+                wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&texture_view),
                 },
-                wgpu::Binding {
+                wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
             ],
             label: None,
         });
-        (
-            Self {
-                pipeline,
-                bind_group,
-                uniform_buf,
-                aspect,
-                uniforms,
-            },
-            Some(init_encoder.finish()),
-        )
+
+        Skybox {
+            pipeline,
+            bind_group,
+            uniform_buf,
+            aspect,
+            uniforms,
+            staging_belt: wgpu::util::StagingBelt::new(0x100),
+        }
     }
 
     fn update(&mut self, _event: winit::event::WindowEvent) {
@@ -267,55 +245,56 @@ impl framework::Example for Skybox {
     fn resize(
         &mut self,
         sc_desc: &wgpu::SwapChainDescriptor,
-        device: &wgpu::Device,
-    ) -> Option<wgpu::CommandBuffer> {
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
         self.aspect = sc_desc.width as f32 / sc_desc.height as f32;
         let uniforms = Skybox::generate_uniforms(self.aspect);
         let mx_total = uniforms[0] * uniforms[1];
         let mx_ref: &[f32; 16] = mx_total.as_ref();
-
-        let temp_buf = device
-            .create_buffer_with_data(bytemuck::cast_slice(mx_ref), wgpu::BufferUsage::COPY_SRC);
-
-        let mut init_encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        init_encoder.copy_buffer_to_buffer(&temp_buf, 0, &self.uniform_buf, 0, 64);
-        self.uniforms = uniforms;
-        Some(init_encoder.finish())
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(mx_ref));
     }
 
     fn render(
         &mut self,
-        frame: &wgpu::SwapChainOutput,
+        frame: &wgpu::SwapChainTexture,
         device: &wgpu::Device,
-    ) -> wgpu::CommandBuffer {
-        let mut init_encoder =
+        queue: &wgpu::Queue,
+        spawner: &framework::Spawner,
+    ) {
+        let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // update rotation
         let rotation = cgmath::Matrix4::<f32>::from_angle_x(cgmath::Deg(0.25));
         self.uniforms[1] = self.uniforms[1] * rotation;
-        let uniform_buf_size = std::mem::size_of::<Uniforms>();
-        let temp_buf = buffer_from_uniforms(&device, &self.uniforms, wgpu::BufferUsage::COPY_SRC);
+        let raw_uniforms = raw_uniforms(&self.uniforms);
+        self.staging_belt
+            .write_buffer(
+                &mut encoder,
+                &self.uniform_buf,
+                0,
+                wgpu::BufferSize::new((raw_uniforms.len() * 4) as wgpu::BufferAddress).unwrap(),
+                device,
+            )
+            .copy_from_slice(bytemuck::cast_slice(&raw_uniforms));
 
-        init_encoder.copy_buffer_to_buffer(
-            &temp_buf,
-            0,
-            &self.uniform_buf,
-            0,
-            uniform_buf_size as wgpu::BufferAddress,
-        );
+        self.staging_belt.finish();
 
         {
-            let mut rpass = init_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
                 color_attachments: &[wgpu::RenderPassColorAttachmentDescriptor {
                     attachment: &frame.view,
                     resolve_target: None,
-                    load_op: wgpu::LoadOp::Clear,
-                    store_op: wgpu::StoreOp::Store,
-                    clear_color: wgpu::Color {
-                        r: 0.1,
-                        g: 0.2,
-                        b: 0.3,
-                        a: 1.0,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.3,
+                            a: 1.0,
+                        }),
+                        store: true,
                     },
                 }],
                 depth_stencil_attachment: None,
@@ -325,7 +304,11 @@ impl framework::Example for Skybox {
             rpass.set_bind_group(0, &self.bind_group, &[]);
             rpass.draw(0..3 as u32, 0..1);
         }
-        init_encoder.finish()
+
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let belt_future = self.staging_belt.recall();
+        spawner.spawn_local(belt_future);
     }
 }
 
